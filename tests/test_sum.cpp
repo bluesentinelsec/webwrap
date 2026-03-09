@@ -87,6 +87,16 @@ TEST(WebWrapTest, ClientOpenAllowsBuiltinOverride) {
     ww_client_close(client);
 }
 
+TEST(WebWrapTest, BackendParseAcceptsKnownNames) {
+    ww_backend_t backend = WW_BACKEND_AUTO;
+
+    ASSERT_EQ(ww_backend_parse("builtin", &backend), 0);
+    EXPECT_EQ(backend, WW_BACKEND_BUILTIN);
+
+    ASSERT_EQ(ww_backend_parse("cfnetwork", &backend), 0);
+    EXPECT_EQ(backend, WW_BACKEND_CFNETWORK);
+}
+
 TEST(WebWrapTest, ClientOpenRejectsUnavailableBackendOverride) {
     ww_client_t *client = nullptr;
     ww_client_options_t options;
@@ -104,6 +114,23 @@ TEST(WebWrapTest, ClientOpenRejectsUnavailableBackendOverride) {
     EXPECT_EQ(client, nullptr);
     EXPECT_EQ(error.type, WW_ERROR_BACKEND_UNAVAILABLE);
     EXPECT_EQ(error.length, std::char_traits<char>::length(error.value));
+}
+
+TEST(WebWrapTest, BuiltinGetReportsNotImplemented) {
+    ww_client_t *client = nullptr;
+    ww_response_t *response = nullptr;
+    ww_client_options_t options;
+    ww_error_t error = {};
+
+    ww_client_options_init(&options);
+    options.backend = WW_BACKEND_BUILTIN;
+
+    ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
+    EXPECT_NE(ww_client_get(client, "http://127.0.0.1/", &response, &error), 0);
+    EXPECT_EQ(response, nullptr);
+    EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+
+    ww_client_close(client);
 }
 
 TEST(WebWrapTest, ServerOpenKeepsServerConfigurationSeparate) {

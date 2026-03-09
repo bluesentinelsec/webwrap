@@ -7,10 +7,20 @@ struct ww_client {
     ww_backend_t backend;
 };
 
+struct ww_response {
+    int status_code;
+    char *body;
+    size_t body_length;
+};
+
 struct ww_server {
     ww_backend_t backend;
     unsigned int workers;
 };
+
+#if defined(__APPLE__)
+#include "platform/apple/ww_apple_http.h"
+#endif
 
 static void ww_error_set(ww_error_t *error, ww_error_type_t type, const char *value) {
     if (error == NULL) {
@@ -56,6 +66,12 @@ const char *ww_error_type_name(ww_error_type_t type) {
             return "invalid_argument";
         case WW_ERROR_BACKEND_UNAVAILABLE:
             return "backend_unavailable";
+        case WW_ERROR_NOT_IMPLEMENTED:
+            return "not_implemented";
+        case WW_ERROR_OUT_OF_MEMORY:
+            return "out_of_memory";
+        case WW_ERROR_REQUEST_FAILED:
+            return "request_failed";
     }
 
     return "unknown";
@@ -78,6 +94,44 @@ const char *ww_backend_name(ww_backend_t backend) {
     }
 
     return "unknown";
+}
+
+int ww_backend_parse(const char *name, ww_backend_t *out_backend) {
+    if (name == NULL || out_backend == NULL) {
+        return -1;
+    }
+
+    if (strcmp(name, "auto") == 0) {
+        *out_backend = WW_BACKEND_AUTO;
+        return 0;
+    }
+
+    if (strcmp(name, "builtin") == 0) {
+        *out_backend = WW_BACKEND_BUILTIN;
+        return 0;
+    }
+
+    if (strcmp(name, "curl") == 0) {
+        *out_backend = WW_BACKEND_CURL;
+        return 0;
+    }
+
+    if (strcmp(name, "winhttp") == 0) {
+        *out_backend = WW_BACKEND_WINHTTP;
+        return 0;
+    }
+
+    if (strcmp(name, "cfnetwork") == 0) {
+        *out_backend = WW_BACKEND_CFNETWORK;
+        return 0;
+    }
+
+    if (strcmp(name, "fetch") == 0) {
+        *out_backend = WW_BACKEND_FETCH;
+        return 0;
+    }
+
+    return -1;
 }
 
 int ww_backend_is_available(ww_backend_t backend) {
@@ -191,6 +245,112 @@ ww_backend_t ww_client_backend(const ww_client_t *client) {
     }
 
     return client->backend;
+}
+
+static int ww_response_alloc(ww_response_t **out_response,
+                             int status_code,
+                             char *body,
+                             size_t body_length,
+                             ww_error_t *error) {
+    ww_response_t *response;
+
+    response = (ww_response_t *)malloc(sizeof(*response));
+    if (response == NULL) {
+        free(body);
+        ww_error_set(error, WW_ERROR_OUT_OF_MEMORY, "failed to allocate response");
+        return -1;
+    }
+
+    response->status_code = status_code;
+    response->body = body;
+    response->body_length = body_length;
+    *out_response = response;
+    ww_error_clear(error);
+    return 0;
+}
+
+static int ww_builtin_client_get(const char *url, ww_response_t **out_response, ww_error_t *error) {
+    (void)url;
+    (void)out_response;
+    ww_error_set(error, WW_ERROR_NOT_IMPLEMENTED, "builtin http client is not implemented yet");
+    return -1;
+}
+
+static int ww_platform_client_get(ww_backend_t backend,
+                                  const char *url,
+                                  ww_response_t **out_response,
+                                  ww_error_t *error) {
+    char *body = NULL;
+    size_t body_length = 0U;
+    int status_code = 0;
+
+    switch (backend) {
+        case WW_BACKEND_BUILTIN:
+            return ww_builtin_client_get(url, out_response, error);
+        case WW_BACKEND_CFNETWORK:
+#if defined(__APPLE__)
+            if (ww_apple_client_get(url, &status_code, &body, &body_length, error) != 0) {
+                return -1;
+            }
+
+            return ww_response_alloc(out_response, status_code, body, body_length, error);
+#else
+            ww_error_set(error, WW_ERROR_BACKEND_UNAVAILABLE, "cfnetwork is unavailable on this platform");
+            return -1;
+#endif
+        case WW_BACKEND_AUTO:
+        case WW_BACKEND_CURL:
+        case WW_BACKEND_WINHTTP:
+        case WW_BACKEND_FETCH:
+            ww_error_set(error, WW_ERROR_NOT_IMPLEMENTED, "selected backend is not implemented yet");
+            return -1;
+    }
+
+    ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "selected backend is invalid");
+    return -1;
+}
+
+int ww_client_get(ww_client_t *client, const char *url, ww_response_t **out_response, ww_error_t *error) {
+    if (client == NULL || out_response == NULL || url == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "client get requires client, url, and response output");
+        return -1;
+    }
+
+    *out_response = NULL;
+    return ww_platform_client_get(client->backend, url, out_response, error);
+}
+
+void ww_response_close(ww_response_t *response) {
+    if (response == NULL) {
+        return;
+    }
+
+    free(response->body);
+    free(response);
+}
+
+int ww_response_status_code(const ww_response_t *response) {
+    if (response == NULL) {
+        return 0;
+    }
+
+    return response->status_code;
+}
+
+const char *ww_response_body(const ww_response_t *response) {
+    if (response == NULL) {
+        return NULL;
+    }
+
+    return response->body;
+}
+
+size_t ww_response_body_length(const ww_response_t *response) {
+    if (response == NULL) {
+        return 0U;
+    }
+
+    return response->body_length;
 }
 
 int ww_server_open(ww_server_t **out_server, const ww_server_options_t *options, ww_error_t *error) {

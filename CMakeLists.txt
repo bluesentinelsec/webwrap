@@ -7,6 +7,11 @@ project(
     LANGUAGES C CXX
 )
 
+if(APPLE)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif()
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -25,12 +30,26 @@ add_library(webwrap STATIC
     src/webwrap.c
 )
 
+if(APPLE)
+    target_sources(webwrap
+        PRIVATE
+            src/platform/apple/ww_apple_http.m
+    )
+
+    target_link_libraries(webwrap
+        PRIVATE
+            "-framework Foundation"
+    )
+endif()
+
 add_library(webwrap::webwrap ALIAS webwrap)
 
 target_include_directories(webwrap
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_compile_definitions(webwrap
@@ -71,12 +90,26 @@ if(WEBWRAP_BUILD_TESTS)
         tests/test_sum.cpp
     )
 
+    if(APPLE)
+        target_sources(webwrap_tests
+            PRIVATE
+                tests/test_macos_get.mm
+        )
+    endif()
+
     target_link_libraries(webwrap_tests
         PRIVATE
             webwrap
             GTest::gtest_main
             Threads::Threads
     )
+
+    if(APPLE)
+        target_link_libraries(webwrap_tests
+            PRIVATE
+                "-framework Foundation"
+        )
+    endif()
 
     include(GoogleTest)
     gtest_discover_tests(webwrap_tests)
