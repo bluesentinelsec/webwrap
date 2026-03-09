@@ -52,6 +52,7 @@ target_link_libraries(webwrap_cli
 set_target_properties(webwrap_cli PROPERTIES OUTPUT_NAME webwrap)
 
 if(WEBWRAP_BUILD_TESTS)
+    find_package(Threads REQUIRED)
     find_package(GTest CONFIG QUIET)
 
     if(NOT GTest_FOUND)
@@ -74,6 +75,7 @@ if(WEBWRAP_BUILD_TESTS)
         PRIVATE
             webwrap
             GTest::gtest_main
+            Threads::Threads
     )
 
     include(GoogleTest)
