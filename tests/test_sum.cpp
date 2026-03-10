@@ -151,6 +151,9 @@ TEST(WebWrapTest, ServerOpenKeepsServerConfigurationSeparate) {
 }
 
 TEST(WebWrapTest, ClientLifecycleIsSafeAcrossThreads) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    GTEST_SKIP() << "threaded lifecycle test requires Emscripten pthread support";
+#else
     constexpr int kThreadCount = 4;
     constexpr int kIterations = 64;
     std::atomic<int> failures{0};
@@ -158,7 +161,7 @@ TEST(WebWrapTest, ClientLifecycleIsSafeAcrossThreads) {
 
     threads.reserve(kThreadCount);
     for (int i = 0; i < kThreadCount; ++i) {
-        threads.emplace_back([&failures]() {
+        threads.emplace_back([&failures, kIterations]() {
             for (int j = 0; j < kIterations; ++j) {
                 ww_client_t *client = nullptr;
                 ww_error_t error = {};
@@ -182,4 +185,5 @@ TEST(WebWrapTest, ClientLifecycleIsSafeAcrossThreads) {
     }
 
     EXPECT_EQ(failures.load(), 0);
+#endif
 }
