@@ -11,6 +11,8 @@ struct ww_header_pair {
 
 struct ww_client {
     ww_backend_t backend;
+    unsigned int request_timeout_ms;
+    unsigned int max_redirects;
 };
 
 struct ww_request {
@@ -195,6 +197,10 @@ const char *ww_error_type_name(ww_error_type_t type) {
             return "out_of_memory";
         case WW_ERROR_REQUEST_FAILED:
             return "request_failed";
+        case WW_ERROR_TIMEOUT:
+            return "timeout";
+        case WW_ERROR_REDIRECT_LIMIT:
+            return "redirect_limit";
     }
 
     return "unknown";
@@ -315,6 +321,8 @@ void ww_client_options_init(ww_client_options_t *options) {
     }
 
     options->backend = WW_BACKEND_AUTO;
+    options->request_timeout_ms = WW_DEFAULT_REQUEST_TIMEOUT_MS;
+    options->max_redirects = WW_DEFAULT_MAX_REDIRECTS;
 }
 
 void ww_server_options_init(ww_server_options_t *options) {
@@ -460,6 +468,8 @@ int ww_client_open(ww_client_t **out_client, const ww_client_options_t *options,
     }
 
     client->backend = selected;
+    client->request_timeout_ms = options == NULL ? WW_DEFAULT_REQUEST_TIMEOUT_MS : options->request_timeout_ms;
+    client->max_redirects = options == NULL ? WW_DEFAULT_MAX_REDIRECTS : options->max_redirects;
     *out_client = client;
     ww_error_clear(error);
     return 0;
@@ -515,6 +525,8 @@ static int ww_builtin_client_send(const ww_request_t *request, ww_response_t **o
 }
 
 static int ww_platform_client_send(ww_backend_t backend,
+                                   unsigned int request_timeout_ms,
+                                   unsigned int max_redirects,
                                    const ww_request_t *request,
                                    ww_response_t **out_response,
                                    ww_error_t *error) {
@@ -536,6 +548,8 @@ static int ww_platform_client_send(ww_backend_t backend,
                                      request->header_count,
                                      request->body,
                                      request->body_length,
+                                     request_timeout_ms,
+                                     max_redirects,
                                      &status_code,
                                      &effective_url,
                                      &body,
@@ -576,7 +590,8 @@ int ww_client_send(ww_client_t *client, const ww_request_t *request, ww_response
     }
 
     *out_response = NULL;
-    return ww_platform_client_send(client->backend, request, out_response, error);
+    return ww_platform_client_send(
+        client->backend, client->request_timeout_ms, client->max_redirects, request, out_response, error);
 }
 
 static int ww_client_send_simple(ww_client_t *client,

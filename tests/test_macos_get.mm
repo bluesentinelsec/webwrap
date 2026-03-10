@@ -11,6 +11,8 @@ namespace {
 static NSString *g_response_body = @"hello from mac";
 static NSInteger g_response_status_code = 200;
 static NSDictionary<NSString *, NSString *> *g_response_headers = nil;
+static NSString *g_response_redirect_target = nil;
+static NSTimeInterval g_response_delay_seconds = 0.0;
 static NSString *g_last_method = nil;
 static NSString *g_last_header_value = nil;
 static NSString *g_last_body = nil;
@@ -23,7 +25,7 @@ static NSString *g_last_body = nil;
 @implementation WebWrapTestProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    return [request.URL.host isEqualToString:@"webwrap.test"];
+    return [request.URL.host hasSuffix:@"webwrap.test"];
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
@@ -31,15 +33,40 @@ static NSString *g_last_body = nil;
 }
 
 - (void)startLoading {
-    NSData *body_data;
-    NSHTTPURLResponse *response;
-
     g_last_method = [self.request.HTTPMethod copy];
     g_last_header_value = [[self.request valueForHTTPHeaderField:@"x-test-header"] copy];
     if (self.request.HTTPBody != nil) {
         g_last_body = [[NSString alloc] initWithData:self.request.HTTPBody encoding:NSUTF8StringEncoding];
     } else {
         g_last_body = nil;
+    }
+
+    if (g_response_delay_seconds > 0.0) {
+        [self performSelector:@selector(finishLoadingResponse) withObject:nil afterDelay:g_response_delay_seconds];
+        return;
+    }
+
+    [self finishLoadingResponse];
+}
+
+- (void)finishLoadingResponse {
+    NSData *body_data;
+    NSHTTPURLResponse *response;
+
+    if (g_response_redirect_target != nil &&
+        [self.request.URL.host isEqualToString:@"redirect.webwrap.test"]) {
+        NSURL *redirect_url = [NSURL URLWithString:g_response_redirect_target];
+        NSDictionary<NSString *, NSString *> *redirect_headers = @{
+            @"Location" : g_response_redirect_target,
+        };
+        response = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                               statusCode:g_response_status_code
+                                              HTTPVersion:@"HTTP/1.1"
+                                             headerFields:redirect_headers];
+        [self.client URLProtocol:self
+            wasRedirectedToRequest:[NSURLRequest requestWithURL:redirect_url]
+                  redirectResponse:response];
+        return;
     }
 
     body_data = [g_response_body dataUsingEncoding:NSUTF8StringEncoding];
@@ -54,6 +81,9 @@ static NSString *g_last_body = nil;
 }
 
 - (void)stopLoading {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(finishLoadingResponse)
+                                               object:nil];
 }
 
 @end
@@ -79,6 +109,8 @@ static void ResetProtocolState(void) {
         @"Content-Length" : @"14",
         @"X-Test-Response" : @"response-value",
     };
+    g_response_redirect_target = nil;
+    g_response_delay_seconds = 0.0;
     g_last_method = nil;
     g_last_header_value = nil;
     g_last_body = nil;
@@ -239,5 +271,50 @@ TEST(WebWrapMacTest, NativeDeleteHelperSendsNoBody) {
     EXPECT_EQ(g_last_body, nil);
 
     ww_response_close(response);
+    ww_client_close(client);
+}
+
+TEST(WebWrapMacTest, NativeGetFailsWhenRedirectLimitIsExceeded) {
+    ScopedProtocolRegistration protocol_registration;
+    ww_client_t *client = nullptr;
+    ww_response_t *response = nullptr;
+    ww_client_options_t options;
+    ww_error_t error = {};
+
+    ResetProtocolState();
+    g_response_redirect_target = @"http://final.webwrap.test/landing";
+    g_response_status_code = 302;
+
+    ww_client_options_init(&options);
+    options.backend = WW_BACKEND_CFNETWORK;
+    options.max_redirects = 0;
+
+    ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
+    EXPECT_NE(ww_client_get(client, "http://redirect.webwrap.test/start", &response, &error), 0);
+    EXPECT_EQ(response, nullptr);
+    EXPECT_EQ(error.type, WW_ERROR_REDIRECT_LIMIT);
+
+    ww_client_close(client);
+}
+
+TEST(WebWrapMacTest, NativeGetFailsOnTimeout) {
+    ScopedProtocolRegistration protocol_registration;
+    ww_client_t *client = nullptr;
+    ww_response_t *response = nullptr;
+    ww_client_options_t options;
+    ww_error_t error = {};
+
+    ResetProtocolState();
+    g_response_delay_seconds = 0.2;
+
+    ww_client_options_init(&options);
+    options.backend = WW_BACKEND_CFNETWORK;
+    options.request_timeout_ms = 20;
+
+    ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
+    EXPECT_NE(ww_client_get(client, "http://slow.webwrap.test/", &response, &error), 0);
+    EXPECT_EQ(response, nullptr);
+    EXPECT_EQ(error.type, WW_ERROR_TIMEOUT);
+
     ww_client_close(client);
 }

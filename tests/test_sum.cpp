@@ -88,6 +88,15 @@ TEST(WebWrapTest, ClientOpenAllowsBuiltinOverride) {
     ww_client_close(client);
 }
 
+TEST(WebWrapTest, ClientOptionsInitSetsDefaultTimeoutAndRedirects) {
+    ww_client_options_t options;
+
+    ww_client_options_init(&options);
+
+    EXPECT_EQ(options.request_timeout_ms, WW_DEFAULT_REQUEST_TIMEOUT_MS);
+    EXPECT_EQ(options.max_redirects, WW_DEFAULT_MAX_REDIRECTS);
+}
+
 TEST(WebWrapTest, RequestOpenAndConfigureWorks) {
     ww_request_t *request = nullptr;
     ww_error_t error = {};

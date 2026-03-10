@@ -27,7 +27,9 @@ typedef enum ww_error_type {
     WW_ERROR_BACKEND_UNAVAILABLE,
     WW_ERROR_NOT_IMPLEMENTED,
     WW_ERROR_OUT_OF_MEMORY,
-    WW_ERROR_REQUEST_FAILED
+    WW_ERROR_REQUEST_FAILED,
+    WW_ERROR_TIMEOUT,
+    WW_ERROR_REDIRECT_LIMIT
 } ww_error_type_t;
 
 typedef struct ww_error {
@@ -36,8 +38,13 @@ typedef struct ww_error {
     size_t length;
 } ww_error_t;
 
+#define WW_DEFAULT_REQUEST_TIMEOUT_MS 30000U
+#define WW_DEFAULT_MAX_REDIRECTS 10U
+
 typedef struct ww_client_options {
     ww_backend_t backend;
+    unsigned int request_timeout_ms;
+    unsigned int max_redirects;
 } ww_client_options_t;
 
 typedef struct ww_server_options {

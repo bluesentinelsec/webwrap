@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 
+#include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,6 +10,80 @@ struct ww_header_pair {
     char *name;
     char *value;
 };
+
+static NSString *const kWebWrapErrorDomain = @"dev.webwrap";
+static NSInteger const kWebWrapRedirectLimitErrorCode = 1;
+
+@interface WWAppleSessionDelegate : NSObject <NSURLSessionDataDelegate, NSURLSessionTaskDelegate>
+
+@property(nonatomic, strong) NSMutableData *responseData;
+@property(nonatomic, strong) NSHTTPURLResponse *httpResponse;
+@property(nonatomic, strong) NSError *requestError;
+@property(nonatomic, assign) NSUInteger redirectCount;
+@property(nonatomic, assign) NSUInteger maxRedirects;
+@property(nonatomic, assign) dispatch_semaphore_t finishedSignal;
+
+@end
+
+@implementation WWAppleSessionDelegate
+
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        _responseData = [[NSMutableData alloc] init];
+    }
+
+    return self;
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+    (void)session;
+    (void)dataTask;
+    self.httpResponse = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+    [self.responseData setLength:0U];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    (void)session;
+    (void)dataTask;
+    [self.responseData appendData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+        newRequest:(NSURLRequest *)request
+ completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler {
+    (void)session;
+    (void)task;
+
+    if (response != nil) {
+        self.redirectCount += 1U;
+        if (self.redirectCount > self.maxRedirects) {
+            self.requestError = [NSError errorWithDomain:kWebWrapErrorDomain
+                                                    code:kWebWrapRedirectLimitErrorCode
+                                                userInfo:nil];
+            completionHandler(nil);
+            return;
+        }
+    }
+
+    completionHandler(request);
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    (void)session;
+    (void)task;
+
+    self.requestError = error;
+    dispatch_semaphore_signal(self.finishedSignal);
+}
+
+@end
 
 static void ww_error_set(ww_error_t *error, ww_error_type_t type, const char *value) {
     if (error == NULL) {
@@ -108,12 +183,42 @@ static int ww_headers_from_dictionary(NSDictionary<id, id> *dictionary,
     return 0;
 }
 
+static ww_error_type_t ww_error_type_from_ns_error(NSError *error) {
+    if (error == nil) {
+        return WW_ERROR_REQUEST_FAILED;
+    }
+
+    if ([error.domain isEqualToString:kWebWrapErrorDomain] && error.code == kWebWrapRedirectLimitErrorCode) {
+        return WW_ERROR_REDIRECT_LIMIT;
+    }
+
+    if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorTimedOut) {
+        return WW_ERROR_TIMEOUT;
+    }
+
+    return WW_ERROR_REQUEST_FAILED;
+}
+
+static const char *ww_error_message_from_type(ww_error_type_t type) {
+    switch (type) {
+        case WW_ERROR_TIMEOUT:
+            return "request timed out";
+        case WW_ERROR_REDIRECT_LIMIT:
+            return "redirect limit exceeded";
+        case WW_ERROR_REQUEST_FAILED:
+        default:
+            return "native macOS request failed";
+    }
+}
+
 int ww_apple_client_send(const char *method,
                          const char *url,
                          const struct ww_header_pair *headers,
                          size_t header_count,
                          const unsigned char *body,
                          size_t body_length,
+                         unsigned int request_timeout_ms,
+                         unsigned int max_redirects,
                          int *out_status_code,
                          char **out_effective_url,
                          char **out_body,
@@ -140,9 +245,10 @@ int ww_apple_client_send(const char *method,
         NSString *url_string = [NSString stringWithUTF8String:url];
         NSURL *ns_url = url_string == nil ? nil : [NSURL URLWithString:url_string];
         NSMutableURLRequest *request;
-        NSURLResponse *response = nil;
-        NSError *request_error = nil;
-        NSData *response_data = nil;
+        WWAppleSessionDelegate *delegate;
+        NSURLSessionConfiguration *configuration;
+        NSURLSession *session;
+        NSURLSessionDataTask *task;
         NSHTTPURLResponse *http_response;
         NSDictionary<id, id> *header_fields;
         char *effective_url;
@@ -157,8 +263,10 @@ int ww_apple_client_send(const char *method,
             return -1;
         }
 
+        configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
         request = [NSMutableURLRequest requestWithURL:ns_url];
         [request setHTTPMethod:method_string];
+        [request setTimeoutInterval:request_timeout_ms == 0U ? 0.0 : ((NSTimeInterval)request_timeout_ms / 1000.0)];
         if (body_length > 0U) {
             [request setHTTPBody:[NSData dataWithBytes:body length:body_length]];
         }
@@ -171,28 +279,51 @@ int ww_apple_client_send(const char *method,
             }
         }
 
-        response_data = [NSURLConnection sendSynchronousRequest:request
-                                             returningResponse:&response
-                                                         error:&request_error];
-
-        if (request_error != nil) {
-            ww_error_set(error, WW_ERROR_REQUEST_FAILED, "native macOS request failed");
+        delegate = [[WWAppleSessionDelegate alloc] init];
+        delegate.maxRedirects = max_redirects;
+        delegate.finishedSignal = dispatch_semaphore_create(0);
+        session = [NSURLSession sessionWithConfiguration:configuration delegate:delegate delegateQueue:nil];
+        task = [session dataTaskWithRequest:request];
+        if (task == nil) {
+            [session invalidateAndCancel];
+            ww_error_set(error, WW_ERROR_REQUEST_FAILED, "failed to create native macOS request task");
             return -1;
         }
 
-        if (![response isKindOfClass:[NSHTTPURLResponse class]]) {
+        [task resume];
+        if (request_timeout_ms > 0U) {
+            dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)request_timeout_ms * 1000000LL);
+            if (dispatch_semaphore_wait(delegate.finishedSignal, timeout) != 0) {
+                [task cancel];
+                [session invalidateAndCancel];
+                delegate.requestError =
+                    [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil];
+            }
+        } else {
+            dispatch_semaphore_wait(delegate.finishedSignal, DISPATCH_TIME_FOREVER);
+        }
+
+        [session finishTasksAndInvalidate];
+
+        if (delegate.requestError != nil) {
+            ww_error_type_t error_type = ww_error_type_from_ns_error(delegate.requestError);
+            ww_error_set(error, error_type, ww_error_message_from_type(error_type));
+            return -1;
+        }
+
+        http_response = delegate.httpResponse;
+        if (http_response == nil) {
             ww_error_set(error, WW_ERROR_REQUEST_FAILED, "response was not an HTTP response");
             return -1;
         }
 
-        http_response = (NSHTTPURLResponse *)response;
         effective_url = ww_nsstring_dup([[http_response URL] absoluteString]);
         if (effective_url == NULL) {
             ww_error_set(error, WW_ERROR_OUT_OF_MEMORY, "failed to allocate effective url");
             return -1;
         }
 
-        response_length = response_data == nil ? 0U : (size_t)[response_data length];
+        response_length = (size_t)[delegate.responseData length];
         response_body = (char *)malloc(response_length + 1U);
         if (response_body == NULL) {
             free(effective_url);
@@ -201,7 +332,7 @@ int ww_apple_client_send(const char *method,
         }
 
         if (response_length > 0U) {
-            memcpy(response_body, [response_data bytes], response_length);
+            memcpy(response_body, [delegate.responseData bytes], response_length);
         }
 
         response_body[response_length] = '\0';
