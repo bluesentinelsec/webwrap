@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 typedef struct ww_client ww_client_t;
+typedef struct ww_request ww_request_t;
 typedef struct ww_response ww_response_t;
 typedef struct ww_server ww_server_t;
 
@@ -58,15 +59,41 @@ ww_backend_t ww_default_server_backend(void);
 void ww_client_options_init(ww_client_options_t *options);
 void ww_server_options_init(ww_server_options_t *options);
 
+int ww_request_open(ww_request_t **out_request, ww_error_t *error);
+void ww_request_close(ww_request_t *request);
+int ww_request_set_method(ww_request_t *request, const char *method, ww_error_t *error);
+int ww_request_set_url(ww_request_t *request, const char *url, ww_error_t *error);
+int ww_request_add_header(ww_request_t *request, const char *name, const char *value, ww_error_t *error);
+int ww_request_set_body(ww_request_t *request, const void *body, size_t body_length, ww_error_t *error);
+
 int ww_client_open(ww_client_t **out_client, const ww_client_options_t *options, ww_error_t *error);
 void ww_client_close(ww_client_t *client);
 ww_backend_t ww_client_backend(const ww_client_t *client);
+int ww_client_send(ww_client_t *client, const ww_request_t *request, ww_response_t **out_response, ww_error_t *error);
 int ww_client_get(ww_client_t *client, const char *url, ww_response_t **out_response, ww_error_t *error);
+int ww_client_post(ww_client_t *client,
+                   const char *url,
+                   const void *body,
+                   size_t body_length,
+                   ww_response_t **out_response,
+                   ww_error_t *error);
+int ww_client_put(ww_client_t *client,
+                  const char *url,
+                  const void *body,
+                  size_t body_length,
+                  ww_response_t **out_response,
+                  ww_error_t *error);
+int ww_client_delete(ww_client_t *client, const char *url, ww_response_t **out_response, ww_error_t *error);
 
 void ww_response_close(ww_response_t *response);
 int ww_response_status_code(const ww_response_t *response);
+const char *ww_response_effective_url(const ww_response_t *response);
 const char *ww_response_body(const ww_response_t *response);
 size_t ww_response_body_length(const ww_response_t *response);
+size_t ww_response_header_count(const ww_response_t *response);
+const char *ww_response_header_name(const ww_response_t *response, size_t index);
+const char *ww_response_header_value_at(const ww_response_t *response, size_t index);
+const char *ww_response_header_value(const ww_response_t *response, const char *name);
 
 int ww_server_open(ww_server_t **out_server, const ww_server_options_t *options, ww_error_t *error);
 void ww_server_close(ww_server_t *server);

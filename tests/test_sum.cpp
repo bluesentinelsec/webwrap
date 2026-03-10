@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <atomic>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -87,6 +88,41 @@ TEST(WebWrapTest, ClientOpenAllowsBuiltinOverride) {
     ww_client_close(client);
 }
 
+TEST(WebWrapTest, RequestOpenAndConfigureWorks) {
+    ww_request_t *request = nullptr;
+    ww_error_t error = {};
+    static const char kBody[] = "payload";
+
+    ASSERT_EQ(ww_request_open(&request, &error), 0);
+    ASSERT_NE(request, nullptr);
+    EXPECT_EQ(ww_request_set_method(request, "POST", &error), 0);
+    EXPECT_EQ(ww_request_set_url(request, "http://example.test/messages", &error), 0);
+    EXPECT_EQ(ww_request_add_header(request, "content-type", "text/plain", &error), 0);
+    EXPECT_EQ(ww_request_set_body(request, kBody, sizeof(kBody) - 1U, &error), 0);
+
+    ww_request_close(request);
+}
+
+TEST(WebWrapTest, ClientSendRequiresMethodAndUrl) {
+    ww_client_t *client = nullptr;
+    ww_request_t *request = nullptr;
+    ww_response_t *response = nullptr;
+    ww_client_options_t options;
+    ww_error_t error = {};
+
+    ww_client_options_init(&options);
+    options.backend = WW_BACKEND_BUILTIN;
+
+    ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
+    ASSERT_EQ(ww_request_open(&request, &error), 0);
+    EXPECT_NE(ww_client_send(client, request, &response, &error), 0);
+    EXPECT_EQ(error.type, WW_ERROR_INVALID_ARGUMENT);
+    EXPECT_EQ(response, nullptr);
+
+    ww_request_close(request);
+    ww_client_close(client);
+}
+
 TEST(WebWrapTest, BackendParseAcceptsKnownNames) {
     ww_backend_t backend = WW_BACKEND_AUTO;
 
@@ -116,8 +152,9 @@ TEST(WebWrapTest, ClientOpenRejectsUnavailableBackendOverride) {
     EXPECT_EQ(error.length, std::char_traits<char>::length(error.value));
 }
 
-TEST(WebWrapTest, BuiltinGetReportsNotImplemented) {
+TEST(WebWrapTest, BuiltinSendReportsNotImplemented) {
     ww_client_t *client = nullptr;
+    ww_request_t *request = nullptr;
     ww_response_t *response = nullptr;
     ww_client_options_t options;
     ww_error_t error = {};
@@ -126,9 +163,40 @@ TEST(WebWrapTest, BuiltinGetReportsNotImplemented) {
     options.backend = WW_BACKEND_BUILTIN;
 
     ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
-    EXPECT_NE(ww_client_get(client, "http://127.0.0.1/", &response, &error), 0);
+    ASSERT_EQ(ww_request_open(&request, &error), 0);
+    ASSERT_EQ(ww_request_set_method(request, "GET", &error), 0);
+    ASSERT_EQ(ww_request_set_url(request, "http://127.0.0.1/", &error), 0);
+    EXPECT_NE(ww_client_send(client, request, &response, &error), 0);
     EXPECT_EQ(response, nullptr);
     EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+
+    ww_request_close(request);
+    ww_client_close(client);
+}
+
+TEST(WebWrapTest, BuiltinShortcutHelpersReportNotImplemented) {
+    ww_client_t *client = nullptr;
+    ww_response_t *response = nullptr;
+    ww_client_options_t options;
+    ww_error_t error = {};
+    static const char kBody[] = "payload";
+
+    ww_client_options_init(&options);
+    options.backend = WW_BACKEND_BUILTIN;
+
+    ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
+
+    EXPECT_NE(ww_client_post(client, "http://127.0.0.1/post", kBody, sizeof(kBody) - 1U, &response, &error), 0);
+    EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+    EXPECT_EQ(response, nullptr);
+
+    EXPECT_NE(ww_client_put(client, "http://127.0.0.1/put", kBody, sizeof(kBody) - 1U, &response, &error), 0);
+    EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+    EXPECT_EQ(response, nullptr);
+
+    EXPECT_NE(ww_client_delete(client, "http://127.0.0.1/delete", &response, &error), 0);
+    EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+    EXPECT_EQ(response, nullptr);
 
     ww_client_close(client);
 }
