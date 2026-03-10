@@ -13,6 +13,16 @@ struct ww_header_pair {
 
 static NSString *const kWebWrapErrorDomain = @"dev.webwrap";
 static NSInteger const kWebWrapRedirectLimitErrorCode = 1;
+static NSInteger const kWebWrapBodyReadErrorCode = 2;
+
+static void ww_error_set(ww_error_t *error, ww_error_type_t type, const char *value);
+
+@interface WWAppleBodyStream : NSInputStream
+
+- (instancetype)initWithReadCallback:(ww_body_read_fn)read_callback userData:(void *)user_data;
+- (ww_error_t)readError;
+
+@end
 
 @interface WWAppleSessionDelegate : NSObject <NSURLSessionDataDelegate, NSURLSessionTaskDelegate>
 
@@ -22,6 +32,130 @@ static NSInteger const kWebWrapRedirectLimitErrorCode = 1;
 @property(nonatomic, assign) NSUInteger redirectCount;
 @property(nonatomic, assign) NSUInteger maxRedirects;
 @property(nonatomic, assign) dispatch_semaphore_t finishedSignal;
+@property(nonatomic, assign) ww_body_write_fn writeCallback;
+@property(nonatomic, assign) void *writeUserData;
+@property(nonatomic, assign) ww_error_t writeError;
+
+@end
+
+@interface WWAppleBodyStream ()
+
+@property(nonatomic, assign) ww_body_read_fn readCallback;
+@property(nonatomic, assign) void *readUserData;
+@property(nonatomic, assign) ww_error_t callbackError;
+@property(nonatomic, assign) NSStreamStatus currentStatus;
+@property(nonatomic, assign) BOOL exhausted;
+@property(nonatomic, strong) NSError *currentError;
+
+@end
+
+@implementation WWAppleBodyStream
+
+- (instancetype)initWithReadCallback:(ww_body_read_fn)read_callback userData:(void *)user_data {
+    self = [super init];
+    if (self != nil) {
+        _readCallback = read_callback;
+        _readUserData = user_data;
+        _callbackError = (ww_error_t){WW_ERROR_NONE, NULL, 0U};
+        _currentStatus = NSStreamStatusNotOpen;
+        _exhausted = NO;
+        _currentError = nil;
+    }
+
+    return self;
+}
+
+- (void)open {
+    if (self.currentStatus == NSStreamStatusNotOpen) {
+        self.currentStatus = NSStreamStatusOpen;
+    }
+}
+
+- (void)close {
+    self.exhausted = YES;
+    self.currentStatus = NSStreamStatusClosed;
+}
+
+- (NSInteger)read:(uint8_t *)buffer maxLength:(NSUInteger)len {
+    size_t bytes_read = 0U;
+
+    if (buffer == NULL || len == 0U) {
+        return 0;
+    }
+
+    if (self.currentStatus == NSStreamStatusClosed || self.currentStatus == NSStreamStatusAtEnd) {
+        return 0;
+    }
+
+    if (self.readCallback == NULL) {
+        self.currentStatus = NSStreamStatusError;
+        self.currentError = [NSError errorWithDomain:kWebWrapErrorDomain code:kWebWrapBodyReadErrorCode userInfo:nil];
+        ww_error_set(&_callbackError, WW_ERROR_INVALID_ARGUMENT, "request body reader is not configured");
+        return -1;
+    }
+
+    if (self.readCallback(self.readUserData, buffer, (size_t)len, &bytes_read, &_callbackError) != 0) {
+        if (_callbackError.type == WW_ERROR_NONE) {
+            ww_error_set(&_callbackError, WW_ERROR_REQUEST_FAILED, "request body reader failed");
+        }
+
+        self.currentStatus = NSStreamStatusError;
+        self.currentError = [NSError errorWithDomain:kWebWrapErrorDomain code:kWebWrapBodyReadErrorCode userInfo:nil];
+        return -1;
+    }
+
+    if (bytes_read == 0U) {
+        self.exhausted = YES;
+        self.currentStatus = NSStreamStatusAtEnd;
+        return 0;
+    }
+
+    self.currentStatus = NSStreamStatusOpen;
+    return (NSInteger)bytes_read;
+}
+
+- (BOOL)getBuffer:(uint8_t * _Nullable * _Nonnull)buffer length:(NSUInteger *)len {
+    (void)buffer;
+    (void)len;
+    return NO;
+}
+
+- (BOOL)hasBytesAvailable {
+    return !self.exhausted;
+}
+
+- (id)propertyForKey:(NSStreamPropertyKey)key {
+    (void)key;
+    return nil;
+}
+
+- (BOOL)setProperty:(id)property forKey:(NSStreamPropertyKey)key {
+    (void)property;
+    (void)key;
+    return NO;
+}
+
+- (void)scheduleInRunLoop:(NSRunLoop *)aRunLoop forMode:(NSRunLoopMode)mode {
+    (void)aRunLoop;
+    (void)mode;
+}
+
+- (void)removeFromRunLoop:(NSRunLoop *)aRunLoop forMode:(NSRunLoopMode)mode {
+    (void)aRunLoop;
+    (void)mode;
+}
+
+- (NSStreamStatus)streamStatus {
+    return self.currentStatus;
+}
+
+- (NSError *)streamError {
+    return self.currentError;
+}
+
+- (ww_error_t)readError {
+    return self.callbackError;
+}
 
 @end
 
@@ -43,14 +177,30 @@ didReceiveResponse:(NSURLResponse *)response
     (void)session;
     (void)dataTask;
     self.httpResponse = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-    [self.responseData setLength:0U];
+    if (self.writeCallback == NULL) {
+        [self.responseData setLength:0U];
+    }
+
     completionHandler(NSURLSessionResponseAllow);
 }
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
     (void)session;
     (void)dataTask;
-    [self.responseData appendData:data];
+
+    if (self.writeCallback == NULL) {
+        [self.responseData appendData:data];
+        return;
+    }
+
+    if (self.writeCallback(self.writeUserData, [data bytes], (size_t)[data length], &_writeError) != 0) {
+        if (_writeError.type == WW_ERROR_NONE) {
+            ww_error_set(&_writeError, WW_ERROR_REQUEST_FAILED, "response body writer failed");
+        }
+
+        [dataTask cancel];
+        self.requestError = [NSError errorWithDomain:kWebWrapErrorDomain code:0 userInfo:nil];
+    }
 }
 
 - (void)URLSession:(NSURLSession *)session
@@ -79,7 +229,10 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     (void)session;
     (void)task;
 
-    self.requestError = error;
+    if (error != nil && self.requestError == nil) {
+        self.requestError = error;
+    }
+
     dispatch_semaphore_signal(self.finishedSignal);
 }
 
@@ -217,8 +370,12 @@ int ww_apple_client_send(const char *method,
                          size_t header_count,
                          const unsigned char *body,
                          size_t body_length,
+                         ww_body_read_fn body_read_fn,
+                         void *body_read_user_data,
                          unsigned int request_timeout_ms,
                          unsigned int max_redirects,
+                         ww_body_write_fn write_fn,
+                         void *write_user_data,
                          int *out_status_code,
                          char **out_effective_url,
                          char **out_body,
@@ -244,6 +401,8 @@ int ww_apple_client_send(const char *method,
         NSString *method_string = [NSString stringWithUTF8String:method];
         NSString *url_string = [NSString stringWithUTF8String:url];
         NSURL *ns_url = url_string == nil ? nil : [NSURL URLWithString:url_string];
+        NSData *body_data = nil;
+        WWAppleBodyStream *body_stream = nil;
         NSMutableURLRequest *request;
         WWAppleSessionDelegate *delegate;
         NSURLSessionConfiguration *configuration;
@@ -264,11 +423,19 @@ int ww_apple_client_send(const char *method,
         }
 
         configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        if (NSClassFromString(@"WebWrapTestProtocol") != Nil) {
+            configuration.protocolClasses = @[ NSClassFromString(@"WebWrapTestProtocol") ];
+        }
+
         request = [NSMutableURLRequest requestWithURL:ns_url];
         [request setHTTPMethod:method_string];
         [request setTimeoutInterval:request_timeout_ms == 0U ? 0.0 : ((NSTimeInterval)request_timeout_ms / 1000.0)];
-        if (body_length > 0U) {
-            [request setHTTPBody:[NSData dataWithBytes:body length:body_length]];
+        if (body_read_fn != NULL) {
+            body_stream = [[WWAppleBodyStream alloc] initWithReadCallback:body_read_fn userData:body_read_user_data];
+            [request setHTTPBodyStream:body_stream];
+        } else if (body_length > 0U) {
+            body_data = [NSData dataWithBytes:body length:body_length];
+            [request setHTTPBodyStream:[NSInputStream inputStreamWithData:body_data]];
         }
 
         for (i = 0; i < header_count; ++i) {
@@ -282,6 +449,9 @@ int ww_apple_client_send(const char *method,
         delegate = [[WWAppleSessionDelegate alloc] init];
         delegate.maxRedirects = max_redirects;
         delegate.finishedSignal = dispatch_semaphore_create(0);
+        delegate.writeCallback = write_fn;
+        delegate.writeUserData = write_user_data;
+        delegate.writeError = (ww_error_t){WW_ERROR_NONE, NULL, 0U};
         session = [NSURLSession sessionWithConfiguration:configuration delegate:delegate delegateQueue:nil];
         task = [session dataTaskWithRequest:request];
         if (task == nil) {
@@ -305,6 +475,16 @@ int ww_apple_client_send(const char *method,
 
         [session finishTasksAndInvalidate];
 
+        if (delegate.writeError.type != WW_ERROR_NONE) {
+            *error = delegate.writeError;
+            return -1;
+        }
+
+        if (body_stream != nil && [body_stream readError].type != WW_ERROR_NONE) {
+            *error = [body_stream readError];
+            return -1;
+        }
+
         if (delegate.requestError != nil) {
             ww_error_type_t error_type = ww_error_type_from_ns_error(delegate.requestError);
             ww_error_set(error, error_type, ww_error_message_from_type(error_type));
@@ -323,7 +503,7 @@ int ww_apple_client_send(const char *method,
             return -1;
         }
 
-        response_length = (size_t)[delegate.responseData length];
+        response_length = write_fn == NULL ? (size_t)[delegate.responseData length] : 0U;
         response_body = (char *)malloc(response_length + 1U);
         if (response_body == NULL) {
             free(effective_url);
@@ -331,7 +511,7 @@ int ww_apple_client_send(const char *method,
             return -1;
         }
 
-        if (response_length > 0U) {
+        if (write_fn == NULL && response_length > 0U) {
             memcpy(response_body, [delegate.responseData bytes], response_length);
         }
 

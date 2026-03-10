@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +21,10 @@ struct ww_request {
     char *url;
     unsigned char *body;
     size_t body_length;
+    ww_body_read_fn body_read_fn;
+    void *body_read_user_data;
+    char *body_file_path;
+    FILE *body_file_stream;
     struct ww_header_pair *headers;
     size_t header_count;
 };
@@ -155,6 +160,86 @@ static int ww_ascii_case_equal(const char *left, const char *right) {
     }
 
     return *left == '\0' && *right == '\0';
+}
+
+static void ww_request_reset_body(ww_request_t *request) {
+    if (request == NULL) {
+        return;
+    }
+
+    free(request->body);
+    request->body = NULL;
+    request->body_length = 0U;
+    request->body_read_fn = NULL;
+    request->body_read_user_data = NULL;
+    if (request->body_file_stream != NULL) {
+        fclose(request->body_file_stream);
+        request->body_file_stream = NULL;
+    }
+
+    free(request->body_file_path);
+    request->body_file_path = NULL;
+}
+
+static int ww_request_read_body_file(void *user_data,
+                                     void *buffer,
+                                     size_t buffer_capacity,
+                                     size_t *out_bytes_read,
+                                     ww_error_t *error) {
+    ww_request_t *request = (ww_request_t *)user_data;
+    size_t bytes_read;
+
+    if (request == NULL || buffer == NULL || out_bytes_read == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "file body reader requires valid inputs");
+        return -1;
+    }
+
+    *out_bytes_read = 0U;
+    if (buffer_capacity == 0U) {
+        ww_error_clear(error);
+        return 0;
+    }
+
+    if (request->body_file_path == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "file body path is not configured");
+        return -1;
+    }
+
+    if (request->body_file_stream == NULL) {
+        request->body_file_stream = fopen(request->body_file_path, "rb");
+        if (request->body_file_stream == NULL) {
+            ww_error_set(error, WW_ERROR_REQUEST_FAILED, "failed to open request body file");
+            return -1;
+        }
+    }
+
+    bytes_read = fread(buffer, 1U, buffer_capacity, request->body_file_stream);
+    if (bytes_read < buffer_capacity && ferror(request->body_file_stream)) {
+        fclose(request->body_file_stream);
+        request->body_file_stream = NULL;
+        ww_error_set(error, WW_ERROR_REQUEST_FAILED, "failed to read request body file");
+        return -1;
+    }
+
+    if (bytes_read == 0U && feof(request->body_file_stream)) {
+        fclose(request->body_file_stream);
+        request->body_file_stream = NULL;
+    }
+
+    *out_bytes_read = bytes_read;
+    ww_error_clear(error);
+    return 0;
+}
+
+static void ww_request_prepare_for_send(const ww_request_t *request) {
+    ww_request_t *mutable_request = (ww_request_t *)request;
+
+    if (mutable_request == NULL || mutable_request->body_file_stream == NULL) {
+        return;
+    }
+
+    clearerr(mutable_request->body_file_stream);
+    rewind(mutable_request->body_file_stream);
 }
 
 static ww_backend_t ww_select_backend(ww_backend_t requested, ww_backend_t default_backend, ww_error_t *error) {
@@ -361,7 +446,7 @@ void ww_request_close(ww_request_t *request) {
 
     free(request->method);
     free(request->url);
-    free(request->body);
+    ww_request_reset_body(request);
     ww_headers_free(request->headers, request->header_count);
     free(request);
 }
@@ -434,9 +519,44 @@ int ww_request_set_body(ww_request_t *request, const void *body, size_t body_len
         return -1;
     }
 
-    free(request->body);
+    ww_request_reset_body(request);
     request->body = body_copy;
     request->body_length = body_length;
+    ww_error_clear(error);
+    return 0;
+}
+
+int ww_request_set_body_reader(ww_request_t *request, ww_body_read_fn read_fn, void *user_data, ww_error_t *error) {
+    if (request == NULL || read_fn == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "request body reader requires request and callback");
+        return -1;
+    }
+
+    ww_request_reset_body(request);
+    request->body_read_fn = read_fn;
+    request->body_read_user_data = user_data;
+    ww_error_clear(error);
+    return 0;
+}
+
+int ww_request_set_body_file(ww_request_t *request, const char *path, ww_error_t *error) {
+    char *path_copy;
+
+    if (request == NULL || path == NULL || path[0] == '\0') {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "request body file path must not be empty");
+        return -1;
+    }
+
+    path_copy = ww_string_dup(path);
+    if (path_copy == NULL) {
+        ww_error_set(error, WW_ERROR_OUT_OF_MEMORY, "failed to allocate request body file path");
+        return -1;
+    }
+
+    ww_request_reset_body(request);
+    request->body_file_path = path_copy;
+    request->body_read_fn = ww_request_read_body_file;
+    request->body_read_user_data = request;
     ww_error_clear(error);
     return 0;
 }
@@ -528,6 +648,8 @@ static int ww_platform_client_send(ww_backend_t backend,
                                    unsigned int request_timeout_ms,
                                    unsigned int max_redirects,
                                    const ww_request_t *request,
+                                   ww_body_write_fn write_fn,
+                                   void *write_user_data,
                                    ww_response_t **out_response,
                                    ww_error_t *error) {
     char *effective_url = NULL;
@@ -548,8 +670,12 @@ static int ww_platform_client_send(ww_backend_t backend,
                                      request->header_count,
                                      request->body,
                                      request->body_length,
+                                     request->body_read_fn,
+                                     request->body_read_user_data,
                                      request_timeout_ms,
                                      max_redirects,
+                                     write_fn,
+                                     write_user_data,
                                      &status_code,
                                      &effective_url,
                                      &body,
@@ -579,6 +705,15 @@ static int ww_platform_client_send(ww_backend_t backend,
 }
 
 int ww_client_send(ww_client_t *client, const ww_request_t *request, ww_response_t **out_response, ww_error_t *error) {
+    return ww_client_send_to_writer(client, request, NULL, NULL, out_response, error);
+}
+
+int ww_client_send_to_writer(ww_client_t *client,
+                             const ww_request_t *request,
+                             ww_body_write_fn write_fn,
+                             void *write_user_data,
+                             ww_response_t **out_response,
+                             ww_error_t *error) {
     if (client == NULL || request == NULL || out_response == NULL) {
         ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "client send requires client, request, and response output");
         return -1;
@@ -590,8 +725,9 @@ int ww_client_send(ww_client_t *client, const ww_request_t *request, ww_response
     }
 
     *out_response = NULL;
+    ww_request_prepare_for_send(request);
     return ww_platform_client_send(
-        client->backend, client->request_timeout_ms, client->max_redirects, request, out_response, error);
+        client->backend, client->request_timeout_ms, client->max_redirects, request, write_fn, write_user_data, out_response, error);
 }
 
 static int ww_client_send_simple(ww_client_t *client,
@@ -637,6 +773,96 @@ int ww_client_get(ww_client_t *client, const char *url, ww_response_t **out_resp
     return ww_client_send_simple(client, "GET", url, NULL, 0U, out_response, error);
 }
 
+int ww_client_get_to_writer(ww_client_t *client,
+                            const char *url,
+                            ww_body_write_fn write_fn,
+                            void *user_data,
+                            ww_response_t **out_response,
+                            ww_error_t *error) {
+    ww_request_t *request = NULL;
+    int rc = -1;
+
+    if (client == NULL || url == NULL || out_response == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "client get-to-writer requires client, url, and response output");
+        return -1;
+    }
+
+    *out_response = NULL;
+    if (ww_request_open(&request, error) != 0) {
+        return -1;
+    }
+
+    if (ww_request_set_method(request, "GET", error) != 0) {
+        goto cleanup;
+    }
+
+    if (ww_request_set_url(request, url, error) != 0) {
+        goto cleanup;
+    }
+
+    rc = ww_client_send_to_writer(client, request, write_fn, user_data, out_response, error);
+
+cleanup:
+    ww_request_close(request);
+    return rc;
+}
+
+static int ww_file_body_writer(void *user_data, const void *buffer, size_t buffer_length, ww_error_t *error) {
+    FILE *stream = (FILE *)user_data;
+
+    if (stream == NULL || (buffer == NULL && buffer_length > 0U)) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "response body file writer requires valid inputs");
+        return -1;
+    }
+
+    if (buffer_length > 0U && fwrite(buffer, 1U, buffer_length, stream) != buffer_length) {
+        ww_error_set(error, WW_ERROR_REQUEST_FAILED, "failed to write response body file");
+        return -1;
+    }
+
+    ww_error_clear(error);
+    return 0;
+}
+
+int ww_client_get_to_file(ww_client_t *client,
+                          const char *url,
+                          const char *path,
+                          ww_response_t **out_response,
+                          ww_error_t *error) {
+    FILE *stream;
+    ww_response_t *response = NULL;
+    int rc;
+
+    if (client == NULL || url == NULL || path == NULL || out_response == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "client get-to-file requires client, url, path, and response output");
+        return -1;
+    }
+
+    *out_response = NULL;
+    stream = fopen(path, "wb");
+    if (stream == NULL) {
+        ww_error_set(error, WW_ERROR_REQUEST_FAILED, "failed to open response body file");
+        return -1;
+    }
+
+    rc = ww_client_get_to_writer(client, url, ww_file_body_writer, stream, &response, error);
+    if (fclose(stream) != 0 && rc == 0) {
+        ww_response_close(response);
+        remove(path);
+        ww_error_set(error, WW_ERROR_REQUEST_FAILED, "failed to close response body file");
+        return -1;
+    }
+
+    if (rc != 0) {
+        remove(path);
+        return -1;
+    }
+
+    *out_response = response;
+    ww_error_clear(error);
+    return 0;
+}
+
 int ww_client_post(ww_client_t *client,
                    const char *url,
                    const void *body,
@@ -646,6 +872,52 @@ int ww_client_post(ww_client_t *client,
     return ww_client_send_simple(client, "POST", url, body, body_length, out_response, error);
 }
 
+static int ww_client_send_file(ww_client_t *client,
+                               const char *method,
+                               const char *url,
+                               const char *path,
+                               ww_response_t **out_response,
+                               ww_error_t *error) {
+    ww_request_t *request = NULL;
+    int rc = -1;
+
+    if (client == NULL || method == NULL || url == NULL || path == NULL || out_response == NULL) {
+        ww_error_set(error, WW_ERROR_INVALID_ARGUMENT, "file client send requires client, method, url, path, and response output");
+        return -1;
+    }
+
+    *out_response = NULL;
+    if (ww_request_open(&request, error) != 0) {
+        return -1;
+    }
+
+    if (ww_request_set_method(request, method, error) != 0) {
+        goto cleanup;
+    }
+
+    if (ww_request_set_url(request, url, error) != 0) {
+        goto cleanup;
+    }
+
+    if (ww_request_set_body_file(request, path, error) != 0) {
+        goto cleanup;
+    }
+
+    rc = ww_client_send(client, request, out_response, error);
+
+cleanup:
+    ww_request_close(request);
+    return rc;
+}
+
+int ww_client_post_file(ww_client_t *client,
+                        const char *url,
+                        const char *path,
+                        ww_response_t **out_response,
+                        ww_error_t *error) {
+    return ww_client_send_file(client, "POST", url, path, out_response, error);
+}
+
 int ww_client_put(ww_client_t *client,
                   const char *url,
                   const void *body,
@@ -653,6 +925,14 @@ int ww_client_put(ww_client_t *client,
                   ww_response_t **out_response,
                   ww_error_t *error) {
     return ww_client_send_simple(client, "PUT", url, body, body_length, out_response, error);
+}
+
+int ww_client_put_file(ww_client_t *client,
+                       const char *url,
+                       const char *path,
+                       ww_response_t **out_response,
+                       ww_error_t *error) {
+    return ww_client_send_file(client, "PUT", url, path, out_response, error);
 }
 
 int ww_client_delete(ww_client_t *client, const char *url, ww_response_t **out_response, ww_error_t *error) {

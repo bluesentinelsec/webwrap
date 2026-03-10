@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -189,9 +191,16 @@ TEST(WebWrapTest, BuiltinShortcutHelpersReportNotImplemented) {
     ww_client_options_t options;
     ww_error_t error = {};
     static const char kBody[] = "payload";
+    const std::filesystem::path download_path = std::filesystem::temp_directory_path() / "webwrap-builtin-download.tmp";
+    const std::filesystem::path upload_path = std::filesystem::temp_directory_path() / "webwrap-builtin-upload.tmp";
 
     ww_client_options_init(&options);
     options.backend = WW_BACKEND_BUILTIN;
+
+    {
+        std::ofstream upload_stream(upload_path);
+        upload_stream << "payload";
+    }
 
     ASSERT_EQ(ww_client_open(&client, &options, &error), 0);
 
@@ -207,7 +216,17 @@ TEST(WebWrapTest, BuiltinShortcutHelpersReportNotImplemented) {
     EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
     EXPECT_EQ(response, nullptr);
 
+    EXPECT_NE(ww_client_get_to_file(client, "http://127.0.0.1/download", download_path.string().c_str(), &response, &error), 0);
+    EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+    EXPECT_EQ(response, nullptr);
+    EXPECT_FALSE(std::filesystem::exists(download_path));
+
+    EXPECT_NE(ww_client_put_file(client, "http://127.0.0.1/upload", upload_path.string().c_str(), &response, &error), 0);
+    EXPECT_EQ(error.type, WW_ERROR_NOT_IMPLEMENTED);
+    EXPECT_EQ(response, nullptr);
+
     ww_client_close(client);
+    std::filesystem::remove(upload_path);
 }
 
 TEST(WebWrapTest, ServerOpenKeepsServerConfigurationSeparate) {

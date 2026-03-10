@@ -38,6 +38,13 @@ typedef struct ww_error {
     size_t length;
 } ww_error_t;
 
+typedef int (*ww_body_read_fn)(void *user_data,
+                               void *buffer,
+                               size_t buffer_capacity,
+                               size_t *out_bytes_read,
+                               ww_error_t *error);
+typedef int (*ww_body_write_fn)(void *user_data, const void *buffer, size_t buffer_length, ww_error_t *error);
+
 #define WW_DEFAULT_REQUEST_TIMEOUT_MS 30000U
 #define WW_DEFAULT_MAX_REDIRECTS 10U
 
@@ -72,24 +79,53 @@ int ww_request_set_method(ww_request_t *request, const char *method, ww_error_t 
 int ww_request_set_url(ww_request_t *request, const char *url, ww_error_t *error);
 int ww_request_add_header(ww_request_t *request, const char *name, const char *value, ww_error_t *error);
 int ww_request_set_body(ww_request_t *request, const void *body, size_t body_length, ww_error_t *error);
+int ww_request_set_body_reader(ww_request_t *request, ww_body_read_fn read_fn, void *user_data, ww_error_t *error);
+int ww_request_set_body_file(ww_request_t *request, const char *path, ww_error_t *error);
 
 int ww_client_open(ww_client_t **out_client, const ww_client_options_t *options, ww_error_t *error);
 void ww_client_close(ww_client_t *client);
 ww_backend_t ww_client_backend(const ww_client_t *client);
 int ww_client_send(ww_client_t *client, const ww_request_t *request, ww_response_t **out_response, ww_error_t *error);
+int ww_client_send_to_writer(ww_client_t *client,
+                             const ww_request_t *request,
+                             ww_body_write_fn write_fn,
+                             void *user_data,
+                             ww_response_t **out_response,
+                             ww_error_t *error);
 int ww_client_get(ww_client_t *client, const char *url, ww_response_t **out_response, ww_error_t *error);
+int ww_client_get_to_writer(ww_client_t *client,
+                            const char *url,
+                            ww_body_write_fn write_fn,
+                            void *user_data,
+                            ww_response_t **out_response,
+                            ww_error_t *error);
+int ww_client_get_to_file(ww_client_t *client,
+                          const char *url,
+                          const char *path,
+                          ww_response_t **out_response,
+                          ww_error_t *error);
 int ww_client_post(ww_client_t *client,
                    const char *url,
                    const void *body,
                    size_t body_length,
                    ww_response_t **out_response,
                    ww_error_t *error);
+int ww_client_post_file(ww_client_t *client,
+                        const char *url,
+                        const char *path,
+                        ww_response_t **out_response,
+                        ww_error_t *error);
 int ww_client_put(ww_client_t *client,
                   const char *url,
                   const void *body,
                   size_t body_length,
                   ww_response_t **out_response,
                   ww_error_t *error);
+int ww_client_put_file(ww_client_t *client,
+                       const char *url,
+                       const char *path,
+                       ww_response_t **out_response,
+                       ww_error_t *error);
 int ww_client_delete(ww_client_t *client, const char *url, ww_response_t **out_response, ww_error_t *error);
 
 void ww_response_close(ww_response_t *response);
